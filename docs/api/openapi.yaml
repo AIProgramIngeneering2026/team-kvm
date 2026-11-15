@@ -6,6 +6,11 @@ info:
     HTTP API for creating and tracking document-processing Jobs.
     One Job processes exactly one PDF or TXT document with one operation.
     OCR and LLM-based processing are not part of the MVP.
+
+    Client identification: every request must include the `X-API-Key`
+    header. The API key identifies the client; Job history, Job visibility,
+    and the `Idempotency-Key` scope are bound to the identified client.
+    Requests without a valid key are rejected with `401 UNAUTHORIZED`.
 servers:
   - url: http://localhost:8000/api/v1
     description: Local development server
@@ -13,6 +18,9 @@ servers:
 tags:
   - name: Jobs
     description: Create Jobs and inspect their state, results, and history.
+
+security:
+  - ApiKeyAuth: []
 
 paths:
   /jobs:
@@ -30,6 +38,12 @@ paths:
         or storing another Job. Reusing the key with different operation or
         file content returns `409 IDEMPOTENCY_KEY_CONFLICT`.
 
+        The same rule applies to a Job in the terminal `failed` state:
+        repeating the request with the same key returns the stored failed
+        Job and does not start processing again. One key identifies one
+        processing attempt; to process the document again, send a new
+        request with a new key.
+
         The key is scoped to the API client and is retained for at least as
         long as the corresponding Job record exists.
       parameters:
@@ -45,7 +59,7 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: A single PDF or UTF-8 TXT document. Maximum proposed size is 10 MiB.
+                  description: A single PDF or UTF-8 TXT document. Maximum size is 10 MiB.
                 operation:
                   type: string
                   enum: [extract_text, text_statistics]
@@ -69,7 +83,7 @@ paths:
                 updated_at: '2026-11-14T16:00:00Z'
                 error: null
         '200':
-          description: An existing Job was returned for a repeated idempotent request.
+          description: An existing Job was returned for a repeated idempotent request. The Job may be in any state, including `failed`; a new processing attempt requires a new key.
           headers:
             Idempotency-Replayed:
               description: Always true when an existing Job is returned.
@@ -82,6 +96,8 @@ paths:
                 $ref: '#/components/schemas/Job'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '409':
           description: The idempotency key was already used with different request content.
           content:
@@ -161,6 +177,8 @@ paths:
                 $ref: '#/components/schemas/JobHistory'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   /jobs/{job_id}:
     parameters:
@@ -176,6 +194,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/JobNotFound'
 
@@ -204,6 +224,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ResultPending'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/JobNotFound'
         '409':
@@ -219,6 +241,15 @@ paths:
                   details: []
 
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Client API key. The key identifies the client: Job history, Job
+        visibility, and the Idempotency-Key scope are bound to it.
+
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -228,7 +259,9 @@ components:
         Optional client-generated key (1–255 visible ASCII characters).
         Within the same client scope, the same key and same operation/file
         content return the existing Job. The same key with different content
-        returns 409 IDEMPOTENCY_KEY_CONFLICT.
+        returns 409 IDEMPOTENCY_KEY_CONFLICT. The existing Job is returned
+        in any state, including `failed`: one key identifies one processing
+        attempt, and a repeated attempt requires a new key.
       schema:
         type: string
         minLength: 1
@@ -352,11 +385,19 @@ components:
       properties:
         code:
           type: string
+          description: |
+            Machine-readable processing error code. `INTERNAL_ERROR` and
+            `PROCESSING_TIMEOUT` are set by JobRunner when a Tool raises an
+            unexpected exception or exceeds the execution time limit; the
+            other codes are reported by the Tool itself or by the Job
+            lifecycle.
           enum:
             - DOCUMENT_CORRUPTED
             - TEXT_NOT_FOUND
             - DOCUMENT_READ_FAILED
             - WORKER_INTERRUPTED
+            - INTERNAL_ERROR
+            - PROCESSING_TIMEOUT
         message:
           type: string
         details:
@@ -391,6 +432,19 @@ components:
           description: Human-readable explanation of the problem.
 
   responses:
+    Unauthorized:
+      description: The request does not include valid client identification.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: A valid X-API-Key header is required.
+              details:
+                - field: X-API-Key
+                  issue: Header is missing or invalid.
     BadRequest:
       description: Request is malformed or contains invalid fields.
       content:
