@@ -1,0 +1,473 @@
+openapi: 3.1.0
+info:
+  title: Document Processing Service API
+  version: 1.0.0
+  description: |
+    HTTP API for creating and tracking document-processing Jobs.
+    One Job processes exactly one PDF or TXT document with one operation.
+    OCR and LLM-based processing are not part of the MVP.
+
+    Client identification: every request must include the `X-API-Key`
+    header. The API key identifies the client; Job history, Job visibility,
+    and the `Idempotency-Key` scope are bound to the identified client.
+    Requests without a valid key are rejected with `401 UNAUTHORIZED`.
+servers:
+  - url: http://localhost:8000/api/v1
+    description: Local development server
+
+tags:
+  - name: Jobs
+    description: Create Jobs and inspect their state, results, and history.
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /jobs:
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      summary: Upload a document and create a Job
+      description: |
+        Accepts one PDF or TXT file and one operation. A newly accepted Job
+        is created in the `created` state and processed asynchronously.
+
+        If `Idempotency-Key` is supplied, the service compares the operation
+        and the uploaded file content. Repeating the same key with the same
+        operation and file content returns the existing Job without creating
+        or storing another Job. Reusing the key with different operation or
+        file content returns `409 IDEMPOTENCY_KEY_CONFLICT`.
+
+        The same rule applies to a Job in the terminal `failed` state:
+        repeating the request with the same key returns the stored failed
+        Job and does not start processing again. One key identifies one
+        processing attempt; to process the document again, send a new
+        request with a new key.
+
+        The key is scoped to the API client and is retained for at least as
+        long as the corresponding Job record exists.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, operation]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: A single PDF or UTF-8 TXT document. Maximum size is 10 MiB.
+                operation:
+                  type: string
+                  enum: [extract_text, text_statistics]
+                  description: Operation to execute for this document.
+            encoding:
+              file:
+                contentType: application/pdf, text/plain
+      responses:
+        '202':
+          description: Job created and accepted for asynchronous processing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+              example:
+                id: 8f6d6d7a-9f9a-4b85-9e6d-4e9f8d7c1a20
+                operation: extract_text
+                status: created
+                filename: report.pdf
+                created_at: '2026-11-14T16:00:00Z'
+                updated_at: '2026-11-14T16:00:00Z'
+                error: null
+        '200':
+          description: An existing Job was returned for a repeated idempotent request. The Job may be in any state, including `failed`; a new processing attempt requires a new key.
+          headers:
+            Idempotency-Replayed:
+              description: Always true when an existing Job is returned.
+              schema:
+                type: boolean
+                const: true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The idempotency key was already used with different request content.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: IDEMPOTENCY_KEY_CONFLICT
+                  message: This Idempotency-Key was already used for a different request.
+                  details: []
+        '413':
+          description: The uploaded file exceeds the configured maximum size.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: FILE_TOO_LARGE
+                  message: The uploaded file exceeds the maximum allowed size.
+                  details:
+                    - field: file
+                      issue: Maximum file size is 10 MiB.
+        '415':
+          description: The file format is not supported. No Job is created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: UNSUPPORTED_FORMAT
+                  message: Only PDF and UTF-8 TXT files are supported.
+                  details:
+                    - field: file
+                      issue: Unsupported file format.
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      summary: Get Job history
+      description: Returns the current client's Jobs, newest first. This is the Job history endpoint.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Filter by Job state.
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - name: operation
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [extract_text, text_statistics]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: A page of Job history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobHistory'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Get Job state and metadata
+      responses:
+        '200':
+          description: Job found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+
+  /jobs/{job_id}/result:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJobResult
+      summary: Get the result of a completed Job
+      description: |
+        A result is available only after the Job reaches `done`.
+        For `created` or `running`, returns HTTP 202 with the current state
+        and without a result. For `failed`, returns HTTP 409 with the
+        stored processing error.
+      responses:
+        '200':
+          description: Job completed successfully; result is available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResult'
+        '202':
+          description: Job is not finished yet; no result is included.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultPending'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '409':
+          description: Job failed; the response contains the stored processing error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: DOCUMENT_CORRUPTED
+                  message: The PDF document is damaged or cannot be parsed.
+                  details: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Client API key. The key identifies the client: Job history, Job
+        visibility, and the Idempotency-Key scope are bound to it.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Optional client-generated key (1–255 visible ASCII characters).
+        Within the same client scope, the same key and same operation/file
+        content return the existing Job. The same key with different content
+        returns 409 IDEMPOTENCY_KEY_CONFLICT. The existing Job is returned
+        in any state, including `failed`: one key identifies one processing
+        attempt, and a repeated attempt requires a new key.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[\x21-\x7E]+$'
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      description: Job UUID.
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    JobStatus:
+      type: string
+      enum: [created, running, done, failed]
+    Operation:
+      type: string
+      enum: [extract_text, text_statistics]
+    Job:
+      type: object
+      required: [id, operation, status, filename, created_at, updated_at, error]
+      properties:
+        id:
+          type: string
+          format: uuid
+        operation:
+          $ref: '#/components/schemas/Operation'
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        filename:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/ProcessingError'
+            - type: 'null'
+          description: Present when status is failed; otherwise null.
+    JobHistory:
+      type: object
+      required: [items, limit, offset, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Job'
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+          minimum: 0
+    JobResult:
+      type: object
+      required: [job_id, status, operation, result]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: done
+        operation:
+          $ref: '#/components/schemas/Operation'
+        result:
+          oneOf:
+            - $ref: '#/components/schemas/ExtractTextData'
+            - $ref: '#/components/schemas/TextStatisticsData'
+    ResultPending:
+      type: object
+      required: [job_id, status, message]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [created, running]
+        message:
+          type: string
+          example: The Job has not completed yet. Try again later.
+    ExtractTextData:
+      type: object
+      required: [text, page_count, format]
+      properties:
+        text:
+          type: string
+        page_count:
+          type: [integer, 'null']
+          minimum: 1
+          description: Number of PDF pages; null for TXT.
+        format:
+          type: string
+          enum: [pdf, txt]
+    TextStatisticsData:
+      type: object
+      required: [word_count, character_count, page_count]
+      properties:
+        word_count:
+          type: integer
+          minimum: 0
+        character_count:
+          type: integer
+          minimum: 0
+          description: Unicode code points, including whitespace, in the extracted text.
+        page_count:
+          type: [integer, 'null']
+          minimum: 1
+          description: Number of PDF pages; null for TXT.
+    ProcessingError:
+      type: object
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+          description: |
+            Machine-readable processing error code. `INTERNAL_ERROR` and
+            `PROCESSING_TIMEOUT` are set by JobRunner when a Tool raises an
+            unexpected exception or exceeds the execution time limit; the
+            other codes are reported by the Tool itself or by the Job
+            lifecycle.
+          enum:
+            - DOCUMENT_CORRUPTED
+            - TEXT_NOT_FOUND
+            - DOCUMENT_READ_FAILED
+            - WORKER_INTERRUPTED
+            - INTERNAL_ERROR
+            - PROCESSING_TIMEOUT
+        message:
+          type: string
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: array
+              items:
+                $ref: '#/components/schemas/ErrorDetail'
+    ErrorDetail:
+      type: object
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          description: Request field or parameter associated with the error.
+        issue:
+          type: string
+          description: Human-readable explanation of the problem.
+
+  responses:
+    Unauthorized:
+      description: The request does not include valid client identification.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: A valid X-API-Key header is required.
+              details:
+                - field: X-API-Key
+                  issue: Header is missing or invalid.
+    BadRequest:
+      description: Request is malformed or contains invalid fields.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: The request contains invalid fields.
+              details:
+                - field: operation
+                  issue: Value must be extract_text or text_statistics.
+    JobNotFound:
+      description: No Job with the specified identifier exists for this client.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: JOB_NOT_FOUND
+              message: Job was not found.
+              details:
+                - field: job_id
+                  issue: No Job exists with this identifier.
