@@ -250,6 +250,17 @@ class DocumentReader(Protocol):
 
 Ошибки жизненного цикла Job, например `INVALID_JOB_TRANSITION` и `WORKER_INTERRUPTED`, не являются ошибками Tool: ими управляет JobService / JobRunner.
 
+### 8.1. Ошибки уровня JobRunner
+
+Инструмент возвращает только осмысленные ошибки из таблицы выше. Ситуации, когда `execute` падает с неожиданным исключением или не возвращает управление, обрабатывает `JobRunner` (см. [ADR-0002](adr/0002-async-jobs.md), п. 4):
+
+| Код | Значение | Где возникает |
+|---|---|---|
+| `INTERNAL_ERROR` | Tool завершился неожиданным исключением, которое не является `ToolResult.error`. | JobRunner перехватывает исключение и переводит Job `running → failed`. |
+| `PROCESSING_TIMEOUT` | Tool не вернул управление за отведённое время (предлагаемый лимит — 60 секунд). | JobRunner ограничивает время выполнения и переводит Job `running → failed`. |
+
+Оба кода сохраняются в `Job.error` и видны клиенту через `GET /jobs/{job_id}` и `GET /jobs/{job_id}/result`. Tool не должен сам возвращать `INTERNAL_ERROR` или `PROCESSING_TIMEOUT` в `ToolResult.error`: если инструмент способен диагностировать проблему, он использует коды из раздела 8.
+
 ## 9. Ограничения MVP
 
 - Одна Job обрабатывает один документ и одну операцию.
