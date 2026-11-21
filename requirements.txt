@@ -1,2 +1,1 @@
 PyMuPDF==2.1
-pytest==9.2.0

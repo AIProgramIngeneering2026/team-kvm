@@ -78,7 +78,7 @@
 Создайте и активируйте виртуальное окружение, затем выполните:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 ```
 
 ### Запуск тестов
