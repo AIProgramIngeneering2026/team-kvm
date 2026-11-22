@@ -1,14 +1,5 @@
-"""Tests for the Dispatcher.
+"""Tests for Dispatcher using the real ToolInput contract."""
 
-core/tools/contract.py (with the real ToolInput) is implemented by another
-teammate in parallel. Until it exists, tests inject a stub contract module
-with the same documented ToolInput structure (see docs/tool-contract.md).
-The stub is only used when the real module is absent.
-"""
-
-import sys
-import types
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
@@ -17,21 +8,11 @@ from core.dispatcher import Dispatcher
 from core.errors import InvalidJobTransitionError, UnknownOperationError
 from core.job import Job, JobStatus
 from core.registry import ToolRegistry
-
-
-@dataclass
-class StubToolInput:
-    job_id: str
-    document_ref: str
-    filename: str
-    media_type: str
-    options: dict = field(default_factory=dict)
-
-
-if "core.tools.contract" not in sys.modules:
-    _contract_stub = types.ModuleType("core.tools.contract")
-    _contract_stub.ToolInput = StubToolInput
-    sys.modules["core.tools.contract"] = _contract_stub
+from core.tools.contract import ToolInput
+from core.tools.contract import ToolError, ToolResult
+from core.tools.document_reader import LocalDocumentReader
+from core.tools.extract_text import ExtractTextTool
+from core.tools.text_statistics import TextStatisticsTool
 
 
 class RecordingTool:
@@ -121,6 +102,8 @@ def test_tool_receives_documented_input():
     dispatcher.dispatch(job)
 
     tool_input = tool.received_input
+
+    assert isinstance(tool_input, ToolInput)
     assert tool_input.job_id == job.id
     assert tool_input.document_ref == "documents/test.txt"
     assert tool_input.filename == "test.txt"
@@ -181,3 +164,55 @@ def test_dispatch_propagates_invalid_job_state():
 
     assert job.status == JobStatus.DONE
     assert job.result == {"text": "Already done"}
+
+
+def test_dispatch_with_real_text_statistics_tool(tmp_path):
+    text = "Привет мир\n"
+
+    documents_dir = tmp_path / "documents"
+    documents_dir.mkdir()
+
+    (documents_dir / "test.txt").write_bytes(
+        text.encode("utf-8")
+    )
+
+    reader = LocalDocumentReader(tmp_path)
+    tool = TextStatisticsTool(reader)
+    dispatcher = create_dispatcher(tool)
+
+    job = create_job(operation="text_statistics")
+
+    result = dispatcher.dispatch(job)
+
+    assert isinstance(result, ToolResult)
+    assert result.ok is True
+    assert job.status == JobStatus.DONE
+    assert job.result == {
+        "word_count": 2,
+        "character_count": len(text),
+        "page_count": None,
+    }
+
+
+def test_dispatch_with_real_tool_error(tmp_path):
+    documents_dir = tmp_path / "documents"
+    documents_dir.mkdir()
+
+    (documents_dir / "test.txt").write_bytes(
+        "  \n".encode("utf-8")
+    )
+
+    reader = LocalDocumentReader(tmp_path)
+    tool = ExtractTextTool(reader)
+    dispatcher = create_dispatcher(tool)
+
+    job = create_job()
+
+    result = dispatcher.dispatch(job)
+
+    assert isinstance(result, ToolResult)
+    assert result.ok is False
+
+    assert job.status == JobStatus.FAILED
+    assert isinstance(job.error, ToolError)
+    assert job.error.code == "TEXT_NOT_FOUND"
